@@ -1,0 +1,11 @@
+pydantic
+python-dotenv
+langchain
+langchain-openai
+langchain-core
+langchain-community
+langchain-groq
+psycopg2
+streamlit
+fastapi
+uvicorn
