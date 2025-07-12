@@ -6,9 +6,10 @@ from langchain.agents.agent_toolkits import SQLDatabaseToolkit
 from langchain.agents import create_sql_agent
 from langchain.chat_models import ChatOpenAI
 from langchain.schema import SystemMessage, HumanMessage
+from langchain.output_parsers import StructuredOutputParser, OutputFixingParser
 import os
 
-# Load environment variables
+# Load env vars
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 DB_HOST = os.environ["DB_HOST"]
 DB_PORT = os.environ.get("DB_PORT", "5432")
@@ -22,14 +23,13 @@ os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 postgresql_user = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 db = SQLDatabase.from_uri(postgresql_user)
 
-# LLM + SQL Agent
+# LLM setup
 llm = ChatOpenAI(model="gpt-4.1", temperature=0)
 toolkit = SQLDatabaseToolkit(db=db, llm=llm)
 agent_executor = create_sql_agent(llm=llm, toolkit=toolkit, verbose=True)
 
 # FastAPI app
 app = FastAPI()
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -41,40 +41,46 @@ app.add_middleware(
 class QueryRequest(BaseModel):
     question: str
 
-# Define structured output schema
+# 1. Define output schema
 class ClassificationResponse(BaseModel):
-    isQuestion: bool = Field(..., description="True if it's a product-related question, otherwise False.")
-    response: str = Field(..., description="If greeting, a message to greet user. If question, just return 'question'.")
+    isQuestion: bool = Field(..., description="True if it's a database question, false if it's a greeting or casual message.")
+    response: str = Field(..., description="If a greeting, the full message. If a question, just the word 'question'.")
 
-# Wrap the LLM with structured output capabilities
-structured_llm = ChatOpenAI(model="gpt-4.1", temperature=0).with_structured_output(ClassificationResponse)
+# 2. Create parser
+output_parser = StructuredOutputParser.from_pexpect(ClassificationResponse)
+fixing_parser = OutputFixingParser.from_parser(output_parser)
 
-# Prompt setup
-def classify_query_with_llm(question: str) -> ClassificationResponse:
-    system_prompt = """
+# 3. Create system prompt with format instructions
+def get_classification_prompt(question: str) -> list:
+    format_instructions = fixing_parser.get_format_instructions()
+
+    system_prompt = f"""
 You are NIA, an intelligent assistant developed by Nijomee Technologies for Nothing Technologies. Nothing is a phone manufacturer company. 
 You help users by answering questions asked by users for their Nothing Operations and also respond politely to greetings.
 
-Your job is to classify user inputs:
-- If it's a greeting (e.g., hi, hello, good morning), respond with a friendly introduction like "Hi, I'm Nia. I can help you with Product ABC..."
-- If it's a question related to Product ABC or its database, classify it as a question.
+- If it's a greeting (e.g., "hi", "hello", "how are you"), respond with a friendly introduction like: "Hi, I'm Nia. I can help you with Product ABC. What would you like to know today?"
+- If it's a product or database-related query, just return: "question"
+- Return your answer as JSON in the following format:
 
-Respond in this structured JSON format:
-{
-  "isQuestion": true/false,
-  "response": "question or greeting message"
-}
+{format_instructions}
 """
-    messages = [
+
+    return [
         SystemMessage(content=system_prompt.strip()),
         HumanMessage(content=question.strip())
     ]
-    return structured_llm.invoke(messages)
 
+# 4. Classify and parse response
+def classify_query(question: str) -> ClassificationResponse:
+    messages = get_classification_prompt(question)
+    response = llm(messages)
+    return fixing_parser.parse(response.content)
+
+# 5. Endpoint
 @app.post("/ask")
 async def ask_question(query: QueryRequest):
     try:
-        parsed = classify_query_with_llm(query.question)
+        parsed: ClassificationResponse = classify_query(query.question)
 
         if parsed.isQuestion:
             result = agent_executor.run(query.question)
@@ -84,3 +90,8 @@ async def ask_question(query: QueryRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+
