@@ -1,15 +1,15 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from langchain.sql_database import SQLDatabase
 from langchain.agents.agent_toolkits import SQLDatabaseToolkit
 from langchain.agents import create_sql_agent
 from langchain.chat_models import ChatOpenAI
 from langchain.schema import SystemMessage, HumanMessage
-from langchain.output_parsers import StructuredOutputParser, OutputFixingParser
 import os
+import json
 
-# Load env vars
+# Load environment variables
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 DB_HOST = os.environ["DB_HOST"]
 DB_PORT = os.environ.get("DB_PORT", "5432")
@@ -19,17 +19,18 @@ DB_PASSWORD = os.environ["POSTGRES_PASSWORD"]
 
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 
-# Database setup
+# DB setup
 postgresql_user = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 db = SQLDatabase.from_uri(postgresql_user)
 
-# LLM setup
+# LLM and Agent
 llm = ChatOpenAI(model="gpt-4.1", temperature=0)
 toolkit = SQLDatabaseToolkit(db=db, llm=llm)
 agent_executor = create_sql_agent(llm=llm, toolkit=toolkit, verbose=True)
 
 # FastAPI app
 app = FastAPI()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -41,57 +42,51 @@ app.add_middleware(
 class QueryRequest(BaseModel):
     question: str
 
-# 1. Define output schema
-class ClassificationResponse(BaseModel):
-    isQuestion: bool = Field(..., description="True if it's a database question, false if it's a greeting or casual message.")
-    response: str = Field(..., description="If a greeting, the full message. If a question, just the word 'question'.")
-
-# 2. Create parser
-output_parser = StructuredOutputParser.from_pexpect(ClassificationResponse)
-fixing_parser = OutputFixingParser.from_parser(output_parser)
-
-# 3. Create system prompt with format instructions
-def get_classification_prompt(question: str) -> list:
-    format_instructions = fixing_parser.get_format_instructions()
-
-    system_prompt = f"""
+# Structured classification using LLM
+def classify_query_structured(llm: ChatOpenAI, user_input: str) -> dict:
+    system_prompt = """
 You are NIA, an intelligent assistant developed by Nijomee Technologies for Nothing Technologies. Nothing is a phone manufacturer company. 
 You help users by answering questions asked by users for their Nothing Operations and also respond politely to greetings.
 
-- If it's a greeting (e.g., "hi", "hello", "how are you"), respond with a friendly introduction like: "Hi, I'm Nia. I can help you with your Nothing operations related questions. What would you like to know today?"
-- If it's a product or database-related query, just return: "question"
-- Return your answer as JSON in the following format:
+Your job is to:
+1. Detect if the input is a greeting (e.g., "hi", "hello", "good morning") or a database/product-related question.
+2. Respond with a JSON object in the following format:
 
-{format_instructions}
+{
+  "isQuestion": true,   // or false
+  "response": "question"  // or greeting message like "Hi, I'm Nia..."
+}
+
+Rules:
+- If the message is a question related to the database, return {"isQuestion": true, "response": "question"}.
+- If it's a greeting or casual message, respond with {"isQuestion": false, "response": "<greeting message>"}.
+- Always return only valid JSON. No explanation or commentary.
 """
-
-    return [
+    messages = [
         SystemMessage(content=system_prompt.strip()),
-        HumanMessage(content=question.strip())
+        HumanMessage(content=user_input.strip())
     ]
 
-# 4. Classify and parse response
-def classify_query(question: str) -> ClassificationResponse:
-    messages = get_classification_prompt(question)
     response = llm(messages)
-    return fixing_parser.parse(response.content)
+    try:
+        return json.loads(response.content.strip())
+    except json.JSONDecodeError:
+        # fallback if LLM fails to return valid JSON
+        return {
+            "isQuestion": True,
+            "response": "question"
+        }
 
-# 5. Endpoint
 @app.post("/ask")
 async def ask_question(query: QueryRequest):
     try:
-        parsed: ClassificationResponse = classify_query(query.question)
+        parsed = classify_query_structured(llm, query.question)
 
-        if parsed.isQuestion:
+        if parsed["isQuestion"]:
             result = agent_executor.run(query.question)
             return {"answer": result}
         else:
-            return {"answer": parsed.response}
+            return {"answer": parsed["response"]}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
-
-
-
