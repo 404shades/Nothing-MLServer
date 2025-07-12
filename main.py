@@ -54,7 +54,7 @@ Your job is to:
 
 {
   "isQuestion": true,   // or false
-  "response": "question"  // or greeting message like "Hi, I'm Nia..."
+  "response": "question"  // or greeting message like "Hi, I'm NIA..."
 }
 
 Rules:
